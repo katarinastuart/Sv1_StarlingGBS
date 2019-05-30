@@ -1,0 +1,1664 @@
+#!/bin/sh
+
+# ----------------------------------------------------------------- #
+#			LANDSCAPE GENETICS CHAPTER GENETICS ANALYSIS			#
+# ----------------------------------------------------------------- #
+# This file contains all the necessary steps required to replicate
+# the genetics analysis conducted for the landscape genetics
+# chapter of my thesis.
+
+# This will involve the necessary steps to produce the following
+# information.
+#	1. Cleaning the data for use
+#	2. fastSTRUCTURE plots
+#		- continental
+#		- substructure for identified genetic groups
+#	3. Generic population genetics statistics at each collection
+#	   locality
+#		- Global Fst
+#		- Fst
+#		- Fis
+#		- He
+#		- Ho
+#		- N
+#	4. Calculate Fst for each sex.
+#	5. Calculate pairwise Fst for use in landscape genetic analysis
+#	6. Preparing data for BOLT-LMM
+
+# NOTE: The data set we are starting with has had blank samples
+# removed, individuals with less than 10% of the average number of
+# SNPs were removed, and SNPs that were recorded in less than 40%
+# of all remaining samples were removed. This was done using the
+# file '/starling_gbs/vcf/mergedSNPs/filtering_snps.sh, and output
+# as 'snps_40.recode.vcf'. This file contains 535 samples, a
+# total of 30880 SNPs and can be found at
+# '/starling_gbs/vcf/landgen/data'.
+
+# ================================================================= #
+
+
+# ----------------------------------------------------------------- #
+#			1. CLEANING THE DATA FOR FURTHER USE					#
+# ----------------------------------------------------------------- #
+# The data needs further filtering before we can continue with data
+# analysis. This includes:
+#	- Removing SNPs that are found in more than 80% of samples. This
+#	  is because these SNPs likely represent repeated regions of the
+#	  genome.
+#	- Removing SNPs out of HWE.
+#	- After having removed so many SNPs we will remove any samples
+#	  that have less than 10% of the average number of SNPs.
+
+# REMOVING OVERREPRESENTED SNPS
+# To remove SNPs that are overrepresented in the data, >80% samples,
+# we must calculate the missingness on a per site basis. Those sites
+# that are found in many samples will have low missingness.
+# NOTE: this code must be run from within the 'landgen' file found
+# at '/starling_gbs/vcf/landgen'.
+vcftools --vcf data/clean/snps_40.recode.vcf --missing-site -c > output/missing-sites_1.txt
+
+# Now that we have the missingness data for each site we will
+# identify those samples that have a frequency of missingness
+# less than 0.2. To do this we can use the following code,
+# and output the corresponding samples to a new text file.
+cat output/missing-sites_1.txt | awk '{ if ($6 <= 0.2) print $1 " " $2}' > output/top-sites_1.txt
+
+# We can use this 'top-sites_1.txt' file to remove those
+# sites that are very common and potentially repetitive sites
+# within our genome.
+vcftools --vcf data/clean/snps_40.recode.vcf --out data/clean/snps_4080 --exclude-positions output/top-sites_1.txt --recode
+
+# Now we want to remove those sites that are out of HWE. To do this
+# we will calculate HWE for each collection locality This requires
+# population files that simply have the sample name of each sample
+# in the population on a new row, there are no headers. This step
+# is executed using an executable .sh file in the src forlder,
+# hwe_calc_vcftools.sh.
+src/hwe_calc_vcftools.sh
+
+# We identify sites that are out of HWE equilibrium, after
+# correcting for False Detection Rate (FDR), in 5 or more
+# populations, or >20% of populations. To do this we use some
+# R script that brings in the files with the HWE stats
+# from the step above and calculate the FDR. The
+# R code is in the file 'hwe_fdr.R', which produces a
+# file consisting of two columns, the first has the
+# chromosome position and the second has the site position.
+R CMD BATCH src/hwe_fdr.R
+
+# Now we can use the output from our R script to remove the sites
+# that are out of HWE in 5 or more pops.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/clean/snps_4080.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/clean/snps_4080_HWErm --exclude-positions /home/apcar/starling_gbs/vcf/landgen/output/hwe/rmsnps_1.txt --recode
+
+# Now we want to filter out all individuals that might have lost a
+# significant number of SNPs and now have less than 10% of the total
+# number of snps. First we have to get the stats for each of our
+# samples and write it to a file.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/clean/snps_4080_HWErm.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/snps_4080_HWErm_dp_1.txt
+
+# We know that there are 26914 so 10% equals ~2691. To identify
+# individuals with less than 10% of the mean number of snps we use
+# the following code, and output the corresponding samples
+# to a new text file.
+cat /home/apcar/starling_gbs/vcf/landgen/output/snps_4080_HWErm_dp_1.txt | awk '{ if ($2 <= 2691) print $1}' > /home/apcar//starling_gbs/vcf/landgen/output/rmid_4080_HWErm_10_1.txt
+
+# Now we will use this text file to remove those poorly represented individuals
+# with vcftools.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/clean/snps_4080_HWErm.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/landgen_data --remove /home/apcar/starling_gbs/vcf/landgen/output/rmid_4080_HWErm_10_1.txt --recode
+
+# YAY, we now have a fully filtered vcf file that we will use for
+# the rest of our analysis. We will now transform the data into
+# formats that can be used for further analysis
+
+# ================================================================= #
+
+
+# ----------------------------------------------------------------- #
+#			2. TRANSFORMING DATA INTO USABLE FORMATS				#
+# ----------------------------------------------------------------- #
+
+
+# In order to run the genetic analysis in the various genetic
+# software that we require we need to transform the data into the
+# formats that each program recognises. The formats that we need
+# are:
+#   - PCAdapt
+#	- PopGenome gsipped tabixed vcf files
+#   - fastStructure plink .bed format
+#   - BOLT-LMM uses plink bed/bim/fam file triple
+#   - Adegenet uses plink .raw file
+
+# PCAdapt is a program that is used to identify outlier loci in large
+# SNP datasets. It includes functions to convert .vcf formated files
+# to the file format required.
+vcf2pcadapt /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+# PopGenome is a package in R that takes a variety of vcf files and
+# allows you to run standard population genetic analysis on large
+# genomic datasets. PopGenome takes gzipped tabixed vcf files so we
+# will gzip and tabix our file to make it usable. bgsip and tabix
+# only work on gandalf, so move into one of those computers before
+# doing the next couple of steps.
+# First we will make a copy of our .vcf fill in the 'data_formats'
+# folder and then compress it with bgzip.
+cp /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf
+bgzip /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf
+
+# Now that it has been bgzipped we can tabix the file, which produces
+# a tabbed index file that goes with the bgzipped file.
+tabix -p vcf /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz
+
+# fastSTRUCTURE is a linux based program that can be used to identify
+# population structure. To use fastSTRUCTURE we need to convert our
+# vcf file into a format that can be read by the program, that is a
+# plink .bed format. To get our vcf file into this format we first
+# need to convert it into a plink .ped format and then to .bed.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data --plink
+
+# This searches through all files similar to the --file and looks for a
+# file ending in .ped. The .ped file is created from the previous command.
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data --out /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data --make-bed
+
+# This creates a .raw file that can then be imported into R via adegenet.
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data --out /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data --recodeA
+
+# ================================================================= #
+
+
+# ----------------------------------------------------------------- #
+#              						3. PCAdapt analysis 	                    #
+# ----------------------------------------------------------------- #
+# We first need to use PCAdapt to determine how many K's we are
+# likely to have in our samples.
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 1 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K1 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 2 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K2 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 3 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K3 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 4 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K4 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 5 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K5 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 6 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K6 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 7 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K7 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+PCAdapt -i /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data -K 8 -o ~/starling_gbs/vcf/landgen/output/PCAdapt/K/pcadapt_K8 -s 400 -b 200 -I /home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data
+
+# Now in R we need to run the get_errors.R script.
+source('~/starling_gbs/vcf/landgen/src/PCAdapt/get_errors.R')
+
+# The tmp file suggests that PCAdapt is not appropriate for this
+# dataset. This could be due to the program imputting missingness
+# data and the dataset having a large amount of missingness.
+
+# ================================================================= #
+
+# ----------------------------------------------------------------- #
+#              		4. BayeScanR Outlier analysis     	              #
+# ----------------------------------------------------------------- #
+# PopGenome is a package in R that calculates general population
+# statistics on large SNP datasets. All of the following calculations
+# are done in R.
+R
+
+		# ------------------------------------------------------------- #
+		#												RUN AS SRC code													#
+		# ------------------------------------------------------------- #
+		# The following code is found in the R script
+		# '/home/apcar/starling_gbs/vcf/landgen/src/popgenomBayeScanR.R'.
+		# First we need to load the PopGenome package.
+		library(PopGenome)
+
+		# To import the data we use the 'readVCF()' function, 'topos'
+		# specifies the lenght of chromosome '1'. We want to read in our
+		# filtered dataset.
+		datGP <- readVCF("/home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz", tid = '1', frompos = 1,
+		    topos = 300000000, numcols = 1000, include.unknown = TRUE)
+
+		# Now we want to specify the populations for our data, so first we
+		# will create population vectors which identify which samples are
+		# in each population. We will do this with a file called populations
+		# to save us copy pasting everything. These populations were
+		# determined from fastSTRUCTURE analysis.
+		source('/home/apcar/starling_gbs/vcf/landgen/src/populations.R')
+
+		# Now we can specify these populations within our dataset.
+		datGP <- set.populations(datGP, list(p1.1, p1.2, p2, p3))
+
+		# Now we can start filling in our datasets with some stats. We
+		# are working with an S4 class object with slots, in PopGenome
+		# when you run one of the statistical analysis functions, e.g.
+		# F_ST.stats(), the output fills related slots. For example,
+		# running F_ST.stats() fills many different slots depending on
+		# the parameters that are selected. To check out all the
+		# different slots, use show.slots().
+		# Lets start by calculating FST stats. The 'detail = TRUE'
+		# parameter is telling the funciton to calculate all of the
+		# associated F_ST statistics rather than just a select few.
+		# NOTE: because of the type of data we have we will only get
+		# nucleotide statistics back.
+		# NOTE2: the function F_ST.stats.2() takes a considerably longer
+		# amount of time to run compared to F_ST.stats.
+		datGP <- F_ST.stats(datGP, detail = TRUE)
+
+		# We will now test to see whether the function BayeScanR in the
+		# PopGenome package is able to identify outlier loci in our data
+		# set.
+		bayesInput <- getBayes(datGP, snps = TRUE)
+
+
+		bayesClass <- BayeScanR(bayesInput,
+														nb.pilot = 20,
+														pilot.runtime = 5000,
+														main.runtime = 100000,
+														discard = 50000)
+
+
+		dat <- data.frame('alpha' = bayesClass@alpha,
+											'var_alpha' = bayesClass@var_alpha,
+											'a_inc' = bayesClass@a_inc,
+											'fst' = bayesClass@fst,
+											'p' = bayesClass@P)
+
+		write.table(dat,
+								'/home/apcar/starling_gbs/vcf/landgen/output/bayescan/bayescan_results.txt',
+								sep = ',', col.names = TRUE, row.names = FALSE)
+
+nohup R CMD BATCH /home/apcar/starling_gbs/vcf/landgen/src/popgenomeBayeScanR.R &
+
+# ================================================================= #
+
+# ================================================================= #
+
+# ----------------------------------------------------------------- #
+#              		5. GeneFeST Outlier analysis     	 	              #
+# ----------------------------------------------------------------- #
+# GeneFeST is a package in R that has been created to identify SNP
+# loci that are potentially under selection. All of the following
+# calculations are done in R.
+R
+
+		# ------------------------------------------------------------- #
+		#												RUN AS SRC CODE													#
+		# ------------------------------------------------------------- #
+		# The following code is found in the R script
+		# '/home/apcar/starling_gbs/vcf/landgen/src/popgenomBayeScanR.R'.
+		# First we need to load the PopGenome package.
+		library(PopGenome)
+
+		# To import the data we use the 'readVCF()' function, 'topos'
+		# specifies the lenght of chromosome '1'. We want to read in our
+		# filtered dataset.
+		datGP <- readVCF("/home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz", tid = '1', frompos = 1,
+		    topos = 300000000, numcols = 1000, include.unknown = TRUE)
+
+		# Now we want to specify the populations for our data, so first we
+		# will create population vectors which identify which samples are
+		# in each population. We will do this with a file called populations
+		# to save us copy pasting everything. These populations were
+		# determined from fastSTRUCTURE analysis.
+		source('/home/apcar/starling_gbs/vcf/landgen/src/populations.R')
+
+		# Now we can specify these populations within our dataset.
+		datGP <- set.populations(datGP, list(p1.1, p1.2, p2, p3))
+
+		# Now we can start filling in our datasets with some stats. We
+		# are working with an S4 class object with slots, in PopGenome
+		# when you run one of the statistical analysis functions, e.g.
+		# F_ST.stats(), the output fills related slots. For example,
+		# running F_ST.stats() fills many different slots depending on
+		# the parameters that are selected. To check out all the
+		# different slots, use show.slots().
+		# Lets start by calculating FST stats. The 'detail = TRUE'
+		# parameter is telling the funciton to calculate all of the
+		# associated F_ST statistics rather than just a select few.
+		# NOTE: because of the type of data we have we will only get
+		# nucleotide statistics back.
+		# NOTE2: the function F_ST.stats.2() takes a considerably longer
+		# amount of time to run compared to F_ST.stats.
+		datGP <- F_ST.stats(datGP, detail = TRUE)
+
+		# We will now test to see whether the function BayeScanR in the
+		# PopGenome package is able to identify outlier loci in our data
+		# set.
+		bayesInput <- getBayes(datGP, snps = TRUE)
+
+
+		results <- GeneFeST(bayesInput, GROUP = FALSE)
+
+
+		dat <- data.frame('alpha' = bayesClass@alpha,
+											'var_alpha' = bayesClass@var_alpha,
+											'a_inc' = bayesClass@a_inc,
+											'fst' = bayesClass@fst,
+											'p' = bayesClass@P)
+
+		write.table(dat,
+								'/home/apcar/starling_gbs/vcf/landgen/output/bayescan/bayescan_results.txt',
+								sep = ',', col.names = TRUE, row.names = FALSE)
+
+nohup R CMD BATCH /home/apcar/starling_gbs/vcf/landgen/src/popgenomeBayeScanR.R &
+
+# ================================================================= #
+
+
+
+# ----------------------------------------------------------------- #
+#              3. fastSTRUCTURE analysis: Global                    #
+# ----------------------------------------------------------------- #
+# This section will run through the fastSTRUCTURE analysis for my
+# dataset. These are the steps that need to be made to obtain a
+# fastSTRUCTURE plot and determine the number of regions in
+# our genetic data set. The following code will be used on the global
+# dataset, that is with all samples included. Once we have identified
+# the number of genetic populations as determined by fastSTRUCTUE we
+# we will then run fastSTRUCTURE on these populations in order to
+# identify any substructure. But first the global set.
+#   - First we need to run the fastSTRUCTURE analysis over
+#	  multiple K's using a 'simple' prior.
+#   - Then we run the fastSTRUCTURE analysis over the K identified
+#     from the simple prior multiple times using a 'logistic'
+#     prior.
+#   - The data is then transferred to a local desktop to create the
+#     fastSTRUCTURE graph.
+
+# When running multiple fastSTRUCTURE jobs we will submit them using
+# qsub on the master node of the cluster. qsub is a program that
+# submits and distributes jobs across available computers on the
+# cluster. The first thing we need to do is run fastSTRUCTURE with
+# a 'simple' prior for multiple K's, we will do it for K's ranging
+# from 1 - 10. To run this we use an executable script:
+nohup /home/apcar/starling_gbs/vcf/landgen/src/s_fs.sh &
+
+# Now we have 10 files corresponding to the ten levels
+# of K that we tested. We will use the chooseK.py function to
+# identify which K best explains the structure in the data.
+python /opt/packages/fastStructure/chooseK.py --input=/home/apcar/starling_gbs/vcf/landgen/output/fs/global/simple/K*
+
+# The fastSTRUCTURE analysis produces a number of files for each
+# run, which provide different information about the run. We can
+# extract the Marginal Likelihood values, which the chooseK.py
+# function is using to select the number of K's, from the .log
+# file of each K run. We can use these values to produce a
+# visual representation of the number of K's we have selected. We take
+# this to R on a personal computer and run the applicable code in
+# the BREAKOUT below.
+grep "Marginal Likelihood = " ~/starling_gbs/vcf/landgen/output/fs/global/simple/*.log | perl -pe 's/:Marginal Likelihood = /\t/' > ~/starling_gbs/vcf/landgen/output/fs/global/simple/simple_margLike.txt
+
+		# BREAKOUT, R: fastSTRUCTURE chooseK graph
+		# ---------------------------------------
+		# Sections labelled 'BREAKOUT' identify sections of
+		# this analysis that are conducted outside of the cluster.
+		# This section describes the code used to produce graphics in
+		# R that represent the selection between different K's for our
+		# simple fastSTRUCTURE run.
+		lapwd <- 'C:/Users/Adam/Dropbox/landgen/data'
+		macwd <- '/Users/jess/Dropbox/landgen/data'
+		setwd(macwd)
+
+		# Import data.
+		sml <- read.table('fs/simple_margLike.txt', sep = '\t', header = FALSE)
+		sml$k <- c(10, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+		colnames(sml) <- c('run', 'mxl', 'k')
+
+		# Plot
+		p <- ggplot(sml, aes(k, mxl)) +
+		geom_line(size = 1) +
+		geom_point(aes(size = 5)) +
+		ggtitle(expression("Tags in ">= "samples (N = TBA tags)")) +
+		xlab('K') +
+		scale_x_continuous(breaks = 1:10) +
+		ylab('Marginal Likelihood') +
+		theme(panel.background = element_blank(),
+			panel.grid = element_blank(),
+			legend.position = 'blank',
+			plot.title = element_text(size = 18, hjust = 0),
+			axis.text = element_text(size = 14, colour = 'gray20'),
+			axis.title = element_text(size = 17, face = 'bold'),
+			axis.line = element_line(colour = 'black'),
+			axis.title.y = element_text(vjust = 1))
+		p
+
+# 'chooseK.py' suggests that the best K is somewhere between 1 and 3
+# K's. By looking at our graph we can see that 3 is our best K. We
+# now want to run multiple fastSTRUCTURE analysis with K = 3 using
+# a logistic prior. To do this we go to the clusters master node
+# and run an executable file which submits multiple jobs to the
+# cluster, with our specified K and prior setting. We want to do
+# this so we can calculate an average value for each sample from
+# the .meanQ file. This file gives the likelihood that a sample
+# is from each genetic population, defined by K. So with
+# our run of K = 3, ever sample will be given a value of how likely
+# it is to belong to each of the 3 populations. We will calculate
+# an average of the top 25 best runs for K = 3 and use this data
+# to plot a fastSTRUCTURE plot. To do this we will first need
+# to create a table with mean .meanQ values, sample name, pop
+# etc. Which we will do in R after the following steps.
+nohup /home/apcar/starling_gbs/vcf/src/r_fs.sh &
+
+# Now we want to create a .txt file of all of the Marginal Likelihood
+# values that we have across all repeated runs of the the logistic
+# fastSTRUCTURE analysis.
+grep "Marginal Likelihood = " ~/starling_gbs/vcf/landgen/output/fs/global/repeated/*.log | perl -pe 's/:Marginal Likelihood = /\t/' > ~/starling_gbs/vcf/landgen/output/fs/global/repeated/repeated_margLike.txt
+
+
+# Now that we have 100 runs of fastSTRUCTURE at K = 3, we will
+# use R to produce the data table required for our graph. Before
+# going into R we need an output of sample names in our data so
+# we can match these with populations values. We will get the sample
+# names by using a generic vcftools function that outputs a file
+# with sample names. We will then import this into R and match it
+# another file that has the corresponding populations for each
+# sample.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/fs/global/landgen_data_dp.txt
+
+
+# ----------------------------------------------------------------- #
+#      CALCULATE AVERAGE '.meanQ' & CREATE TABLE FOR PLOTTING 	    #
+# ----------------------------------------------------------------- #
+# The following code will be run in R on the cluster.
+# First open up R.
+R
+
+# We will be using some functions created by another user of
+# fastSTRUCTURE (found on STRUCTURE google group), which requires
+# the working directory to be set to the location of our .meanQ
+# files. So we will set the directory.
+setwd('~/starling_gbs/vcf/landgen/output/fs/global/repeated')
+
+# Now we will load in those special functions which will help us
+# calculate the mean .meanQ for each of our samples.
+source("~/bin/fastStructure-master/fastStructurePlotting_functions.R")
+
+# We will bring in the file that has our sample names in it and
+# the file with corresponding collection locality names so we
+# can match them up and begin creating the data frame for plotting.
+samps <- read.table('~/starling_gbs/vcf/landgen/output/fs/global/landgen_data_dp.txt', sep = '\t', header = TRUE)
+
+# This samps file will have each row in the same order as the data
+# from the .meanQ files. Later on we want to merge these two data
+# sets but the .meanQ data wont have any identifying info to do so,
+# except for the order in which the file is imported. So before we
+# start playing with our 'samps' data and changing the order of
+# things we will create a new column which we will use to order by
+# later to make sure our samples will align when we merge them.
+samps$ord <- 1:nrow(samps)
+
+# Now the collection locality file.
+pops <- read.table('~/starling_gbs/morph/key-file_morph_env_allplates.txt', sep = '\t', header = TRUE)
+
+# Now we will merge these two data sets so we have a matching
+# collection locality for every sample in our data.
+samps <- merge(samps, pops, by.x = "INDV", by.y = "FullSampleName", all.x = TRUE, all.y = FALSE)
+
+# To get a nice looking fastSTRUCTURE plot our samples need to
+# be ordered prior to graphing. This is because ggplot2 graphs things
+# in the order they appear in the data.frame. We will bring in the
+# file which orders our populations across Australian from west to
+# east. We will also give the columns appropriate names.
+gord <- read.table('~/starling_gbs/pops/pop_ordered_across_aust.txt', sep = '\t', header = FALSE)
+colnames(gord) <- c('location', 'order')
+
+# Before we merge or samps data and order data we will first need
+# to make sure the location names match exactly.
+summary(samps$location)
+gord
+
+# Now we will merge this with our samps data set so we can
+# order our data.frame by locality and then longitude.
+samps <- merge(samps, gord, by.x = 'location', by.y = 'location', all.x = TRUE, all.y = FALSE)
+
+# This merge has reordered our data.frame, we need to get it back into
+# the correct order before merging it with our .meanQ data in a
+# moment.
+samps <- samps[order(samps[,'ord']),]
+
+# Now we want to bring in the likes.txt file we created earlier so
+# we have the names of each of our runs. We will use these names
+# to identify the .meanQ files we are interested in in order to
+# get mean values for each sample and each K. We will also clean
+# up the names and produce a new column that specifies
+# which K each row relates to.
+likes=read.table("~/starling_gbs/vcf/landgen/output/fs/global/repeated/repeated_marglike.txt")
+likes[,1]=sub(".log","",likes[,1])
+likes[,1]=sub("~/starling_gbs/vcf/landgen/output/fs/global/repeated/","",likes[,1])
+
+# To keep only the last charachter in our run name
+# we use the following function. We only want the
+substrRight <- function(x, n){substr(x, nchar(x)-n+1, nchar(x))}
+likes$K = substrRight(likes[,1], 1)
+
+# Because we know that K = 3 is our best number of K we will created
+# a subset likes data.frame which only specifies files associated
+# with K = 3.
+likes3 <- likes[which(as.numeric(likes[,3]) == 3),]
+
+# Now we will clculate the means value of liklihood for each sample
+# in the 3 populations as dictated by our best K. We use the
+# averageBest() function developed by a fastSTRUCTURE user.
+# NOTE: I had to change the averageBest code so that the argument
+# likelihoods was recognised in calling the dataframe bests.
+means=averageBest(likelihoods=likes3,top=25)
+
+# We will take a quick look at means so we know what we are looking
+# at.
+head(means)
+
+# The data.frame has no column names so we will label these
+colnames(means) <- c('p1', 'p2', 'p3')
+
+# Now we will build the data.frame that we wil use to created our
+# fastSTRUCTURE graph. We want to include sample ids, location
+# names, order, and the 'means' data. Putting all of these columns
+# only works because we know they are currently in the same order,
+# that is the order that the samples appear in in the .vcf file, or
+# which is ordered by FullSampleName.
+k3 <- data.frame(samps$INDV, samps$ord, samps$location, samps$x, samps$y, samps$order, means)
+
+# We will take the time to fix up the column names.
+colnames(k3) <- c('id', 'ord', 'loc', 'lon', 'lat', 'gord', 'p1', 'p2', 'p3')
+
+# Now we will order our data by our order column and decending
+# longitude.
+k3 <- k3[order(k3[,'ord'], -k3[,'lon']),]
+
+# Now we will write this data frame to a file and run create the
+# graph in R outside of the cluster.
+write.table(k3, file = '~/starling_gbs/vcf/landgen/output/fs/global/k3-data-for-graphing.txt', col.names = TRUE, row.names = FALSE, sep = '\t')
+
+		# BREAKOUT, R: fastSTRUCTURE global graph
+		# ---------------------------------------
+		# This section describes the code used to produce fastSTRUCTURE
+		# graph in R.
+        library(ggplot2, reshape2)
+
+        # First we need to bring in the data.
+        k3 <- read.table("Dropbox/Manuscripts/landGen/data/fs/k3-data-for-graphing.txt",
+						 sep = '\t', header = TRUE)
+
+        # Our order will get put all out of whack in ggplot if we don't add
+        # some '0' to the front of our order numbers.
+        k3$gord <- ifelse(nchar(k3[1:length(k3$id),'gord']) == 1,
+                paste('0',k3$gord, sep = ''), as.character(k3$gord))
+
+        # We need to transform the the data from wide to long form.
+        require(reshape2)
+        k3 <- melt(k3, id=c("id", "loc", 'lon', 'lat', 'ord', 'gord'))
+
+        # Reorder the data to the geographic order.
+        k3 <- k3[order(k3[,'gord'], -k3[,'lon'], k3[,'id']),]
+
+        # Produce unique numbers for each of the samples
+        k3$uniq <- rep(1:530, each = 3)
+
+        # This is too create lines that separate our populations, and have
+        # them be grey or black depending if they separate localities or
+        # states.
+        vlines <- data.frame(x = as.numeric(cumsum(summary(as.factor(k3$gord)))/3),
+                    grp = c(1,2,1,1,1,2,1,1,1,2,1,1,2,1,1,1,1,1,1,1,1,1,1,1))
+                    vlines.palette <- c('grey', 'black')
+        vlines <- vlines[-24,]
+
+        # This is a simple function that will be used to generate equally spaced hues
+        # around a colour wheel, so that the graph is easy to look at.
+        gg_color_hue <- function(n) {
+        hues = seq(15, 375, length=n+1)
+        hcl(h=hues, l=65, c=100)[1:n]
+        }
+
+        cols = gg_color_hue(3)
+        dev.new(width=3, height=3)
+        plot(1:n, pch=16, cex=2, col=cols)
+
+		xlabels <- c('Munglinup', '','','','','','','','','','','','','','','','','','','','','',
+					 'Condingup', '','','','','','','','','','','','','','','','','','','','',
+					 'Coorabie', '','','','','','','','','','','','','','','','','','','','','',
+					 'Streaky Bay', '','','','','','','','','','','','','','',
+					 'Tumby Bay', '','','','','','','','','','','','','','','','','','','','','','',
+					 'McLarenvale','','','','','','','','','','','','','','','','','','','',
+					 'Warnambool', '','','','','','','','','','','','','','','','','','','','','','','',
+					 'Bendigo', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Wonthaggi', '','','','','','','','','','','','','','','','','','','','','',
+					 'Orbost', '','','','','','','','','','','','','','','','','','','','','','','',
+					 'King Island', '','','','','','','','','','','','','','','',
+					 'Sheffield', '','','','','','','','','','','','','','','','','','','','','','','',
+					 'Cygnet', '','','','','','','','','','','','','','','','','','','',
+                     'Hay', '','','','','','','','','','','','','','','','','','','','','', '','','','',
+                     'Albury', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Nowra', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Maitland', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Dubbo', '','','','','','','','','','','','','','','','','','','',
+					 'Nyngan', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Austral Eden', '','','','','','','','','','','','','','','','','','','','','','','',
+					 'Tamworth', '','','','','','','','','','',
+					 'Moree', '','','','','','','','','','','','','','','','','','','','','','','','',
+					 'Lismore', '','','','','','','','','','','','','','','','','','','','','','',
+					 'Lemon', '','','','','','','','','','','','','','','','','','','','','','')
+
+        plot <- ggplot(k3, aes(uniq, value, fill = variable)) +
+            scale_fill_manual(values = c("p1" = cols[1], "p2" = cols[2], "p3" = cols[3])) +
+            geom_bar(stat = 'identity', width = 1) +
+            geom_vline(data = vlines, aes(xintercept = x, colour = as.factor(grp))) +
+            scale_colour_manual(values= c('grey', 'black')) +
+            scale_x_discrete(labels = xlabels) +
+            scale_y_continuous(name="", breaks= NULL, limits=c(0,1.01)) +
+            theme(panel.background = element_blank(),
+                panel.grid = element_blank(),
+                legend.position = 'blank',
+                axis.text.x = element_text(angle = 90, size = 18),
+                axis.title.x = element_blank(),
+                axis.ticks.x = element_blank())
+
+        plot
+
+# ----------------------------------------------------------------- #
+#   		IN R: SPLIT DATA SET BY REGION                      #
+# ----------------------------------------------------------------- #
+# We have plotted out fastSTRUCTURE plot for k3, but now we want to
+# split our data by genetic populations and run a fastSTRCUTURE
+# analysis on each sub population to see if we have any more genetic
+# divisions. To do this we will melt our k3 data set created above
+# aggregate the data by sample keeping only the maximum value.
+R
+require(reshape)
+
+# First we need to bring in out data.
+k3 <- read.table("~/starling_gbs/vcf/landgen/output/fs/global/k3-data-for-graphing.txt",
+                    sep = '\t', header = TRUE)
+require(reshape)
+k3 <- melt(k3, id=c("id", "loc", 'lon', 'lat', 'ord', 'gord'))
+
+# Now to aggregate the data keeping only the maximum value out of
+# the three possible population values for each individual.
+k3agg <- do.call(data.frame, aggregate(value ~ id, data = k3, function(x) max(x)))
+
+# Now that we have a maximum value for each sample we can use this
+# with the sample name to find which genetic population it
+# corresponds to.
+k3max <- merge(k3agg, k3, by = c('id', 'value'), all.x = TRUE, all.y = FALSE)
+
+# Now we will subset our data based on population.
+k3p1 <- k3max[which(k3max$variable == 'p1'),]
+k3p2 <- k3max[which(k3max$variable == 'p2'),]
+k3p3 <- k3max[which(k3max$variable == 'p3'),]
+length(k3p1$id)
+length(k3p2$id)
+length(k3p3$id)
+
+# We will now export the sample names in each of our genetic pop
+# files into a .txt file so that we can use it to filter our
+# .vcf file for further fastSTRUCTURE analysis.
+write.table(k3p1[,1], file = '~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1_samples.txt', col.names = FALSE, row.names = FALSE, sep = '\t')
+write.table(k3p2[,1], file = '~/starling_gbs/vcf/landgen/output/fs/sub/p2/p2_samples.txt', col.names = FALSE, row.names = FALSE, sep = '\t')
+write.table(k3p3[,1], file = '~/starling_gbs/vcf/landgen/output/fs/sub/p3/p3_samples.txt', col.names = FALSE, row.names = FALSE, sep = '\t')
+
+
+# ----------------------------------------------------------------- #
+#               RUNNING fastSTRUCTURE ON SUBPOPS                    #
+# ----------------------------------------------------------------- #
+# Now that we have a list of indivudals to filter our data by we can
+# create three new .vcf files each corresponding to one of the
+# genetic populations we have identified. But first we need to clean
+# up the p1_samples.txt files to remove the '"' marks from around
+# the sample names.
+sed 's/"//g' ~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1_samples.txt > ~/starling_gbs/vcf/landgen/output/fs/sub/p1/temp.txt
+mv ~/starling_gbs/vcf/landgen/output/fs/sub/p1/temp.txt ~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1_samples.txt
+
+sed 's/"//g' ~/starling_gbs/vcf/landgen/output/fs/sub/p2/p2_samples.txt > ~/starling_gbs/vcf/landgen/output/fs/sub/p2/temp.txt
+mv ~/starling_gbs/vcf/landgen/output/fs/sub/p2/temp.txt ~/starling_gbs/vcf/landgen/output/fs/sub/p2/p2_samples.txt
+
+sed 's/"//g' ~/starling_gbs/vcf/landgen/output/fs/sub/p3/p3_samples.txt > ~/starling_gbs/vcf/landgen/output/fs/sub/p3/temp.txt
+mv ~/starling_gbs/vcf/landgen/output/fs/sub/p3/temp.txt ~/starling_gbs/vcf/landgen/output/fs/sub/p3/p3_samples.txt
+
+# Now we can filter our data with these genetic population sample
+# and create new .vcf files to run fastSTRUCTURE analysis on.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p1/clean/landgen_p1 --keep /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p1/p1_samples.txt --max-missing 0.1 --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p2/clean/landgen_p2 --keep /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p2/p2_samples.txt --max-missing 0.1 --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/landgen_data.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p3/clean/landgen_p3 --keep /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p3/p3_samples.txt --max-missing 0.1 --recode
+
+# Before we run fast structure we need to clean our data by
+# removing loci out of HWE.
+# Now we want to remove those sites that are out of HWE. To do this
+# we will calculate HWE for each collection locality This requires
+# population files that simply have the sample name of each sample
+# in the population on a new row, there are no headers. This step
+# is executed using an executable .sh file in the src forlder,
+# hwe_calc_vcftools.sh.
+src/hwe_calc_vcftools_p1.sh
+src/hwe_calc_vcftools_p2.sh
+src/hwe_calc_vcftools_p3.sh
+
+# We need to remove the empty files so that the next script will
+# work. This should be done from within the folder the files are
+# found in.
+# P1
+rm hwe_vcf_form_albury.csv hwe_vcf_form_austral.csv hwe_vcf_form_bendigo.csv hwe_vcf_form_dubbo.csv hwe_vcf_form_ki.csv hwe_vcf_form_lemon.csv hwe_vcf_form_lismore.csv hwe_vcf_form_maitland.csv hwe_vcf_form_moree.csv hwe_vcf_form_nowra.csv hwe_vcf_form_nyngan.csv hwe_vcf_form_tamworth.csv
+# P2
+rm hwe_vcf_form_dubbo.csv hwe_vcf_form_lemon.csv hwe_vcf_form_maitland.csv hwe_vcf_form_moree.csv hwe_vcf_form_nowra.csv
+# P3
+rm hwe_vcf_form_bendigo.csv hwe_vcf_form_ki.csv hwe_vcf_form_munglinup.csv hwe_vcf_form_streaky.csv hwe_vcf_form_tumby.csv hwe_vcf_form_warnambool.csv hwe_vcf_form_wonthaggi.csv
+
+# We identify sites that are out of HWE equilibrium, after
+# correcting for False Detection Rate (FDR), in 5 or more
+# populations, or >20% of populations. To do this we use some
+# R script that brings in the files with the HWE stats
+# from the step above and calculate the FDR. The
+# R code is in the file 'hwe_fdr.R', which produces a
+# file consisting of two columns, the first has the
+# chromosome position and the second has the site position.
+R CMD BATCH src/hwe_fdr_p1.R
+R CMD BATCH src/hwe_fdr_p2.R
+R CMD BATCH src/hwe_fdr_p3.R
+
+# Now we can use the output from our R script to remove the sites
+# that are out of HWE in 3 or more pops.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p1/clean/landgen_p1.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p1/clean/landgen_p1_HWErm --exclude-positions /home/apcar/starling_gbs/vcf/landgen/output/hwe/p1/rmsnps_p1.txt --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p2/clean/landgen_p2.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p2/clean/landgen_p2_HWErm --exclude-positions /home/apcar/starling_gbs/vcf/landgen/output/hwe/p2/rmsnps_p2.txt --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p3/clean/landgen_p3.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p3/clean/landgen_p3_HWErm --exclude-positions /home/apcar/starling_gbs/vcf/landgen/output/hwe/p3/rmsnps_p3.txt --recode
+
+# Now we want to filter out all individuals that might have lost a
+# significant number of SNPs and now have less than 10% of the average
+# number of snps. First we have to get the stats for each of our
+# samples and write it to a file.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p1/clean/landgen_p1_HWErm.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/p1/landgen_p1_HWErm_dp.txt
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p2/clean/landgen_p2_HWErm.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/p2/landgen_p2_HWErm_dp.txt
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p3/clean/landgen_p3_HWErm.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/p3/landgen_p3_HWErm_dp.txt
+
+# Now we can use awk to calcuate the mean number of snps we have
+# for our samples and then calculate 10% of this.
+awk '{ total += $2 } END { print total/NR }' /home/apcar/starling_gbs/vcf/landgen/output/p1/landgen_p1_HWErm_dp.txt
+
+awk '{ total += $2 } END { print total/NR }' /home/apcar/starling_gbs/vcf/landgen/output/p2/landgen_p2_HWErm_dp.txt
+
+awk '{ total += $2 } END { print total/NR }' /home/apcar/starling_gbs/vcf/landgen/output/p3/landgen_p3_HWErm_dp.txt
+
+# Take the resulting value and find what 10% is.
+echo '7411*0.1' | bc
+echo '9657*0.1' | bc
+echo '9148*0.1' | bc
+
+# We calculated a mean of 8865 so 10% equals ~887. To identify
+# individuals with less than 10% of the mean number of snps we use
+# the following code, and output the corresponding samples
+# to a new text file.
+cat /home/apcar/starling_gbs/vcf/landgen/output/p1/landgen_p1_HWErm_dp.txt | awk '{ if ($2 <= 741) print $1}' > /home/apcar//starling_gbs/vcf/landgen/output/p1/rmid_p1_HWErm_10.txt
+
+cat /home/apcar/starling_gbs/vcf/landgen/output/p2/landgen_p2_HWErm_dp.txt | awk '{ if ($2 <= 966) print $1}' > /home/apcar//starling_gbs/vcf/landgen/output/p2/rmid_p2_HWErm_10.txt
+
+cat /home/apcar/starling_gbs/vcf/landgen/output/p3/landgen_p3_HWErm_dp.txt | awk '{ if ($2 <= 915) print $1}' > /home/apcar//starling_gbs/vcf/landgen/output/p3/rmid_p3_HWErm_10.txt
+
+# Now we will use this text file to remove those poorly represented individuals
+# with vcftools.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p1/clean/landgen_p1_HWErm.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --remove /home/apcar/starling_gbs/vcf/landgen/output/p1/rmid_p1_HWErm_10.txt --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p2/clean/landgen_p2_HWErm.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --remove /home/apcar/starling_gbs/vcf/landgen/output/p2/rmid_p2_HWErm_10.txt --recode
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p3/clean/landgen_p3_HWErm.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --remove /home/apcar/starling_gbs/vcf/landgen/output/p3/rmid_p3_HWErm_10.txt --recode
+
+# Now we need to convert our vcf file into a format that can be
+# read by the program, that is a plink .bed format. To get our
+# vcf file into this format we first need to convert it into a
+# plink .ped format and then to .bed. First we create the .ped
+# and then the .bed file and finally a .raw file, for each of
+# out subpopulations.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --plink
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --out /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --make-bed
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --out /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1 --recodeA
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --plink
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --out /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --make-bed
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --out /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2 --recodeA
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3.recode.vcf --out /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --plink
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --out /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --make-bed
+plink --file /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --out /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3 --recodeA
+
+# Now we can run fastSTRUCTURE analysis with a simple prior for each
+# of these genetic populations. We do this by running the scripts
+# that have been modified for these data sets, to submit jobs to
+# the cluster.
+nohup ~/starling_gbs/vcf/landgen/src/s_fs_p1.sh &
+nohup ~/starling_gbs/vcf/landgen/src/s_fs_p2.sh &
+nohup ~/starling_gbs/vcf/landgen/src/s_fs_p3.sh &
+
+python /opt/packages/fastStructure/chooseK.py --input=/home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p1/simple/K*
+python /opt/packages/fastStructure/chooseK.py --input=/home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p2/simple/K*
+python /opt/packages/fastStructure/chooseK.py --input=/home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p3/simple/K*
+
+
+# From this we can see only p1 looks like it might have sub
+# populations.
+
+# The fastSTRUCTURE analysis produces a number of files for each
+# run, which provide different information about the run. We can
+# extract the Marginal Likelihood values, which the chooseK.py
+# function is using to select the number of K's, from the .log
+# file of each K run. We can use these values to produce a
+# visual representation of the number of K's we have selected. This
+# code needs to be run from within the fastSTRUCTURE folder. We take
+# this to R on our personal computer and run the applicable code in
+# 'fastSTRUCTURE_graphs.R'.
+grep "Marginal Likelihood = " ~/starling_gbs/vcf/landgen/output/fs/sub/p1/simple/*.log | perl -pe 's/:Marginal Likelihood = /\t/' > ~/starling_gbs/vcf/landgen/output/fs/sub/p1/simple/simple_likes_p1.txt
+
+
+# THERE ARE NO FURTHER SUBPOPULATIONS
+
+# We will use a logistic prior, which can help elucidate subpops
+# where it might be very subtle.
+nohup ~/starling_gbs/vcf/landgen/src/r_fs_p1.sh &
+
+
+# From the output of chooseK for the runs with a simple prior
+# we can tell that p1 = K, p2 = K and p3 = K. We
+# 'fastSTRUCTURE_graphs.R'.
+grep "Marginal Likelihood = " ~/starling_gbs/vcf/landgen/output/fs/sub/p1/repeated/*.log | perl -pe 's/:Marginal Likelihood = /\t/' > ~/starling_gbs/vcf/landgen/output/fs/sub/p1/repeated/repeated_marglike_p1.txt
+
+# Now that we have 100 runs of fastSTRUCTURE at K = 3, we will
+# use R to produce the data table required for our graph. Before
+# going into R we need an output of sample names in our data so
+# we can match these with populations values. We will get the sample
+# names by using a generic vcftools function that outputs a file
+# with sample names. We will then import this into R and match it
+# another file that has the corresponding populations for each
+# sample.
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p1/landgen_p1.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p1/landgen_p1_dp.txt
+
+
+# ----------------------------------------------------------------- #
+# 4.1 CALCULATE AVERAGE '.meanQ' & CREATE TABLE FOR PLOTTING SUB P1 #
+# ----------------------------------------------------------------- #
+# The following code will be run in R on the cluster.
+# First open up R.
+R
+
+# We will be using some functions created by another user of
+# fastSTRUCTURE (found on STRUCTURE google group), which requires
+# the working directory to be set to the location of our .meanQ
+# files. So we will set the directory.
+setwd('~/starling_gbs/vcf/landgen/output/fs/sub/p1/repeated')
+
+# Now we will load in those special functions which will help us
+# calculate the mean .meanQ for each of our samples.
+source("~/bin/fastStructure-master/fastStructurePlotting_functions.R")
+
+# We will bring in the file that has our sample names in it and
+# the file with corresponding collection locality names so we
+# can match them up and begin creating the data frame for plotting.
+samps <- read.table('~/starling_gbs/vcf/landgen/output/fs/sub/p1/landgen_p1_dp.txt', sep = '\t', header = TRUE)
+
+# This samps file will have each row in the same order as the data
+# from the .meanQ files. Later on we want to merge these two data
+# sets but the .meanQ data wont have any identifying info to do so,
+# except for the order in which the file is imported. So before we
+# start playing with our 'samps' data and changing the order of
+# things we will create a new column which we will use to order by
+# later to make sure our samples will align when we merge them.
+samps$ord <- 1:nrow(samps)
+
+# Now the collection locality file.
+pops <- read.table('~/starling_gbs/morph/key-file_morph_env_allplates.txt', sep = '\t', header = TRUE)
+
+# Now we will merge these two data sets so we have a matching
+# collection locality for every sample in our data.
+samps <- merge(samps, pops, by.x = "INDV", by.y = "FullSampleName", all.x = TRUE, all.y = FALSE)
+
+# To get a nice looking fastSTRUCTURE plot our samples need to
+# be ordered prior to graphing. This is because ggplot2 graphs things
+# in the order they appear in the data.frame. We will bring in the
+# file which orders our populations across Australian from west to
+# east. We will also give the columns appropriate names.
+gord <- read.table('~/starling_gbs/pops/pop_ordered_across_aust.txt', sep = '\t', header = FALSE)
+colnames(gord) <- c('location', 'order')
+
+# Before we merge or samps data and order data we will first need
+# to make sure the location names match exactly.
+summary(samps$location)
+gord
+
+# Now we will merge this with our samps data set so we can
+# order our data.frame by locality and then longitude.
+samps <- merge(samps, gord, by.x = 'location', by.y = 'location', all.x = TRUE, all.y = FALSE)
+
+# This merge has reordered our data.frame, we need to get it back into
+# the correct order before merging it with our .meanQ data in a
+# moment.
+samps <- samps[order(samps[,'ord']),]
+
+# Now we want to bring in the likes.txt file we created earlier so
+# we have the names of each of our runs. We will use these names
+# to identify the .meanQ files we are interested in in order to
+# get mean values for each sample and each K. We will also clean
+# up the names and produce a new column that specifies
+# which K each row relates to.
+likes=read.table("~/starling_gbs/vcf/landgen/output/fs/sub/p1/repeated/repeated_marglike_p1.txt")
+likes[,1]=sub(".log","",likes[,1])
+likes[,1]=sub("~/starling_gbs/vcf/landgen/output/fs/sub/p1/repeated/","",likes[,1])
+
+# To keep only the last charachter in our run name
+# we use the following function. We only want the
+substrRight <- function(x, n){substr(x, nchar(x)-n+1, nchar(x))}
+likes$K = substrRight(likes[,1], 1)
+
+# Now we will clculate the means value of liklihood for each sample
+# in the 3 populations as dictated by our best K. We use the
+# averageBest() function developed by a fastSTRUCTURE user.
+# NOTE: I had to change the averageBest code so that the argument
+# likelihoods was recognised in calling the dataframe bests.
+means=averageBest(likelihoods=likes,top=25)
+
+# We will take a quick look at means so we know what we are looking
+# at.
+head(means)
+
+# The data.frame has no column names so we will label these
+colnames(means) <- c('p1', 'p2')
+
+# Now we will build the data.frame that we wil use to created our
+# fastSTRUCTURE graph. We want to include sample ids, location
+# names, order, and the 'means' data. Putting all of these columns
+# only works because we know they are currently in the same order,
+# that is the order that the samples appear in in the .vcf file, or
+# which is ordered by FullSampleName.
+k2 <- data.frame(samps$INDV, samps$ord, samps$location, samps$x, samps$y, samps$order, means)
+
+# We will take the time to fix up the column names.
+colnames(k2) <- c('id', 'ord', 'loc', 'lon', 'lat', 'gord', 'p1', 'p2')
+
+# Now we will order our data by our order column and decending
+# longitude.
+k2 <- k2[order(k2[,'ord'], -k2[,'lon']),]
+
+# Now we will write this data frame to a file and run create the
+# graph in R outside of the cluster.
+write.table(k2, file = '~/starling_gbs/vcf/landgen/output/fs/sub/p1/k2-data-for-graphing_p1.txt', col.names = TRUE, row.names = FALSE, sep = '\t')
+
+		# BREAKOUT, R: fastSTRUCTURE global graph
+		# ---------------------------------------
+		# This section describes the code used to produce fastSTRUCTURE
+		# graph in R.
+		library(ggplot2, reshape2)
+
+		# First we need to bring in the data.
+		k2 <- read.table("Dropbox/Manuscripts/landGen/data/fs/k2-data-for-graphing_p1.txt", sep = '\t', header = TRUE)
+
+		# Our order will get put all out of whack in ggplot if we don't add
+		# some '0' to the front of our order numbers.
+		k2$gord <- ifelse(nchar(k2[1:length(k2$id),'gord']) == 1,
+		paste('0',k2$gord, sep = ''), as.character(k2$gord))
+
+		# We need to transform the the data from wide to long form.
+		require(reshape2)
+		k2 <- melt(k2, id=c("id", "loc", 'lon', 'lat', 'ord', 'gord'))
+
+		# Reorder the data to the geographic order.
+		k2 <- k2[order(k2[,'gord'], -k2[,'lon'], k2[,'id']),]
+
+		# Produce unique numbers for each of the samples
+		k2$uniq <- rep(1:148, each = 2)
+
+		# This is too create lines that separate our populations, and have
+		# them be grey or black depending if they separate localities or
+		# states.
+		vlines <- data.frame(x = as.numeric(cumsum(summary(as.factor(k2$gord)))/2),
+		grp = c(1,2,1,1,1,2,1,1,2,1,2,1))
+		vlines.palette <- c('grey', 'black')
+		vlines <- vlines[-12,]
+
+		# This is a simple function that will be used to generate equally spaced hues
+		# around a colour wheel, so that the graph is easy to look at.
+		gg_color_hue <- function(n) {
+		hues = seq(15, 375, length=n+1)
+		hcl(h=hues, l=65, c=100)[1:n]
+		}
+
+		n = 2
+		cols = gg_color_hue(2)
+		dev.new(width=2, height=2)
+		plot(1:n, pch=16, cex=2, col=cols)
+
+		xlabels <- c('Munglinup', '','','','','','','','','','','','','','','','','','','',
+		'Condingup', '','','','','','','','','','','','','','','','',
+		'Coorabie', '','','','','','','','','','','','','','','','','','',
+		'Streaky Bay', '','','','','','','','',
+		'Tumby Bay', '','','','','','','','','','','','','','','','','','','','',
+		'McLarenvale','','','','','','','','','','','','','','','','','',
+		'Warnambool', '',
+		'Wonthaggi', '','','',
+		'Orbost',
+		'Sheffield', '','','','','','','','','','','','','','','','','','',
+		'Cygnet', '','','','','','','','','','','','','','','',
+		'Hay', '','','','','')
+
+		plot <- ggplot(k2, aes(uniq, value, fill = variable)) +
+		scale_fill_manual(values = c("p1" = cols[1], "p2" = cols[2])) +
+		geom_bar(stat = 'identity', width = 1) +
+		geom_vline(data = vlines, aes(xintercept = x, colour = as.factor(grp))) +
+		scale_colour_manual(values= c('grey', 'black')) +
+		scale_x_discrete(labels = xlabels) +
+		scale_y_continuous(name="", breaks= NULL, limits=c(0,1.01)) +
+		theme(panel.background = element_blank(),
+		panel.grid = element_blank(),
+		legend.position = 'blank',
+		axis.text.x = element_text(angle = 90, size = 18),
+		axis.title.x = element_blank(),
+		axis.ticks.x = element_blank())
+
+		plot
+
+# ----------------------------------------------------------------- #
+#   		IN R: SPLIT DATA SET BY SUB REGION                      #
+# ----------------------------------------------------------------- #
+# We have plotted out fastSTRUCTURE plot for k3, but now we want to
+# split our data by genetic populations and run a fastSTRCUTURE
+# analysis on each sub population to see if we have any more genetic
+# divisions. To do this we will melt our k3 data set created above
+# aggregate the data by sample keeping only the maximum value.
+R
+require(reshape)
+
+# First we need to bring in out data.
+k2 <- read.table("~/starling_gbs/vcf/landgen/output/fs/sub/p1/k2-data-for-graphing_p1.txt",
+                    sep = '\t', header = TRUE)
+require(reshape)
+k2 <- melt(k2, id=c("id", "loc", 'lon', 'lat', 'ord', 'gord'))
+
+# Now to aggregate the data keeping only the maximum value out of
+# the three possible population values for each individual.
+k2agg <- do.call(data.frame, aggregate(value ~ id, data = k2, function(x) max(x)))
+
+# Now that we have a maximum value for each sample we can use this
+# with the sample name to find which genetic population it
+# corresponds to.
+k2max <- merge(k2agg, k2, by = c('id', 'value'), all.x = TRUE, all.y = FALSE)
+
+# Now we will subset our data based on population.
+k2p1.1 <- k2max[which(k2max$variable == 'p1'),]
+k2p1.2 <- k2max[which(k2max$variable == 'p2'),]
+length(k2p1.1$id)
+length(k2p1.2$id)
+
+# We will now export the sample names in each of our genetic pop
+# files into a .txt file so that we can use it to filter our
+# .vcf file for further fastSTRUCTURE analysis.
+write.table(k2p1.1[,1], file = '~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1.1_samples.txt', col.names = FALSE, row.names = FALSE, sep = '\t')
+write.table(k2p1.2[,1], file = '~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1.2_samples.txt', col.names = FALSE, row.names = FALSE, sep = '\t')
+
+
+
+# ================================================================= #
+
+
+# ----------------------------------------------------------------- #
+#                      4. PopGenome analysis                        #
+# ----------------------------------------------------------------- #
+# In order to get regional statistics we need to specify which
+# samples are in each genetic population.
+# For p1.1 and p1.2 used the output in
+# ~/starling_gbs/vcf/landgen/output/fs/sub/p1/p1.2_samples.txt
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p2/landgen_p2.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p2/landgen_p2_dp.txt
+cat /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p2/landgen_p2_dp.txt | awk '{ print $1 }' > /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p2/temp.txt
+mv ~/starling_gbs/vcf/landgen/output/fs/sub/p2/temp.txt ~/starling_gbs/vcf/landgen/output/fs/sub/p2/p2_samplesFinal.txt
+
+vcftools --vcf /home/apcar/starling_gbs/vcf/landgen/data/p3/landgen_p3.recode.vcf --depth -c > /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p3/landgen_p3_dp.txt
+cat /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p3/landgen_p3_dp.txt | awk '{ print $1 }' > /home/apcar/starling_gbs/vcf/landgen/output/fs/sub/p3/temp.txt
+mv ~/starling_gbs/vcf/landgen/output/fs/sub/p3/temp.txt ~/starling_gbs/vcf/landgen/output/fs/sub/p3/p3_samplesFinal.txt
+
+		# ONCE OFF, R: specify regions
+		# ---------------------------------------
+		# This section describes how to specify the regions
+		# identified by fast structure. We want to do this so
+		# that we can get regionally stats. All we need to do
+		# is take the sample names identified in p1_samplesFinal.txt
+		# and for p2 and p3, and include them in out populations.txt
+		# file which is used by popgenome to identify pops.
+		# This is manual and each region needs to look like:
+		# p1 <- C('sample1',
+		#		  'sample2',
+		#		   etc..)
+		# I have done this by copy pasting the sample names into
+		# sublime text 2 (editor) and using the following cmds:
+			# 1. select lines
+			# 2. command + shift + L
+			# 3. right arrow
+			# 4. Comma
+		# to add '"' to the start and end of each row and ',' to the
+		# end of each row. This was then copied into the
+		# ~/starling_gbs/vcf/landgen/src/populations.txt file
+
+# ----------------------------------------------------------------- #
+#               4.1 PopGenome collection localities                 #
+# ----------------------------------------------------------------- #
+# PopGenome is a package in R that calculates general population
+# statistics on large SNP datasets. All of the following calculations
+# are done in R.
+R
+
+# First we need to load the PopGenome package.
+library(PopGenome)
+
+# To import the data we use the 'readVCF()' function, 'topos'
+# specifies the lenght of chromosome '1'.
+datCL <- readVCF("/home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz", tid = '1', frompos = 1,
+    topos = 300000000, numcols = 1000, include.unknown = TRUE)
+
+# Now we want to specify the populations for our data, so first we
+# will create population vectors which identify which samples are
+# in each population. We will do this with a file called populations
+# to save us copy pasting everything.
+source('/home/apcar/starling_gbs/vcf/landgen/src/populations.R')
+
+
+# Now we can specify these populations within our dataset.
+datCL <- set.populations(datCL, list(Albury, Austral, Bendigo, Condingup,
+                            Coorabie, Cygnet, Dubbo, Hay, KingIsland,
+                            Lemon, Lismore, Maitland, McLarenvale,
+                            Moree, Munglinup, Nowra, Nyngan, Orbost,
+                            Sheffield, StreakyBay, Tamworth, TumbyBay,
+                            Warnambool, Wonthaggi))
+
+# Now we can start filling in our datasets with some stats. We
+# are working with an S4 class object with slots, in PopGenome
+# when you run one of the statistical analysis functions, e.g.
+# F_ST.stats(), the output fills related slots. For example,
+# running F_ST.stats() fills many different slots depending on
+# the parameters that are selected. To check out all the
+# different slots, use show.slots().
+# Lets start by calculating FST stats. The 'detail = TRUE'
+# parameter is telling the funciton to calculate all of the
+# associated F_ST statistics rather than just a select few.
+# NOTE: because of the type of data we have we will only get
+# nucleotide statistics back.
+# NOTE2: the function F_ST.stats.2() takes a considerably longer
+# amount of time to run compared to F_ST.stats.
+datCL <- F_ST.stats(datCL, detail = TRUE)
+datCL <- F_ST.stats.2(datCL)
+
+# There are several different ways to access the statistical results
+# that have been returned. The '.stats' functions have a method for
+# calling there results, get.F_ST(), this has a couple of parameters
+# which help select exactly which statistic you are after. For
+# instance, the code below produce the same results, however,
+# calling objects directly with dat@ seems to provide cleaner tabels.
+get.F_ST(datCL)[,2]
+datCL@nucleotide.F_ST
+
+# As noted earlier, because of the nature of our data only
+# nucleotide F_ST statistics are calculated. The slots that we are
+# interested in after running the above analysis are.
+@nucleotide.F_ST
+@nuc.F_ST.pairwise
+@nuc.F_ST.vs.all
+@nuc.diversity.between
+@nuc.diversity.within
+@Hudson.Snn
+@region.stats@nucleotide.diversity
+
+# Now we will calculate some neutrality statistics.
+datCL <- neutrality.stats(datCL, detail = TRUE, do.R2 = TRUE)
+
+# The slots that have been modified by neutrality.stats() and
+# which we are interested in are:
+@n.segregating.sites
+@Tajima.D
+@Fu.Li.F
+@Fu.Li.D
+@Fu.F_S
+@Rozas.R_2
+
+# Now we will calculate some generic mixed statistics
+# with detail.stats().
+datCL <- detail.stats(datCL, biallelic.structure = TRUE,
+                    mismatch.distribution = TRUE,
+                    site.spectrum = TRUE, site.FST = TRUE)
+
+
+# The slots that have been modified by detail.stats() and
+# which we are interested in are:
+@MDSD
+@MDG1
+@MDG2
+@region.stats@minor.allele.freqs
+@region.stats@site.FST
+
+# Before exiting the R session we will save the objects that we have
+# built up thus far. It will be easier to GENOME datasets that we
+# have already calculated statistics for rather than calculating
+# them all over again. Many of the statistics take too long to
+# calculate to make calculating them again feasable.
+save.session(datCL, '~/starling_gbs/vcf/landgen/data/popgenome/datCL')
+
+# ----------------------------------------------------------------- #
+#               4.1 PopGenome genetic populations 	                #
+# ----------------------------------------------------------------- #
+# PopGenome is a package in R that calculates general population
+# statistics on large SNP datasets. All of the following calculations
+# are done in R.
+R
+
+# First we need to load the PopGenome package.
+library(PopGenome)
+
+# To import the data we use the 'readVCF()' function, 'topos'
+# specifies the lenght of chromosome '1'.
+datGP <- readVCF("/home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz", tid = '1', frompos = 1,
+    topos = 300000000, numcols = 1000, include.unknown = TRUE)
+
+# Now we want to specify the populations for our data, so first we
+# will create population vectors which identify which samples are
+# in each population. We will do this with a file called populations
+# to save us copy pasting everything.
+source('/home/apcar/starling_gbs/vcf/landgen/src/populations.R')
+
+
+# Now we can specify these populations within our dataset.
+datGP <- set.populations(datGP, list(p1.1, p1.2, p2, p3))
+
+# Now we can start filling in our datasets with some stats. We
+# are working with an S4 class object with slots, in PopGenome
+# when you run one of the statistical analysis functions, e.g.
+# F_ST.stats(), the output fills related slots. For example,
+# running F_ST.stats() fills many different slots depending on
+# the parameters that are selected. To check out all the
+# different slots, use show.slots().
+# Lets start by calculating FST stats. The 'detail = TRUE'
+# parameter is telling the funciton to calculate all of the
+# associated F_ST statistics rather than just a select few.
+# NOTE: because of the type of data we have we will only get
+# nucleotide statistics back.
+# NOTE2: the function F_ST.stats.2() takes a considerably longer
+# amount of time to run compared to F_ST.stats.
+datGP <- F_ST.stats(datGP, detail = TRUE)
+datGP <- F_ST.stats.2(datGP)
+
+# There are several different ways to access the statistical results
+# that have been returned. The '.stats' functions have a method for
+# calling there results, get.F_ST(), this has a couple of parameters
+# which help select exactly which statistic you are after. For
+# instance, the code below produce the same results, however,
+# calling objects directly with dat@ seems to provide cleaner tabels.
+get.F_ST(datGP)[,2]
+datGP@nucleotide.F_ST
+
+# As noted earlier, because of the nature of our data only
+# nucleotide F_ST statistics are calculated. The slots that we are
+# interested in after running the above analysis are.
+@nucleotide.F_ST
+@nuc.F_ST.pairwise
+@nuc.F_ST.vs.all
+@nuc.diversity.between
+@nuc.diversity.within
+@Hudson.Snn
+@region.stats@nucleotide.diversity
+
+# Now we will calculate some neutrality statistics.
+datGP <- neutrality.stats(datGP, detail = TRUE, do.R2 = TRUE)
+
+# The slots that have been modified by neutrality.stats() and
+# which we are interested in are:
+@n.segregating.sites
+@Tajima.D
+@Fu.Li.F
+@Fu.Li.D
+@Fu.F_S
+@Rozas.R_2
+
+# Now we will calculate some generic mixed statistics
+# with detail.stats().
+datGP <- detail.stats(datGP, biallelic.structure = TRUE,
+                    mismatch.distribution = TRUE,
+                    site.spectrum = TRUE, site.FST = TRUE)
+
+
+# The slots that have been modified by detail.stats() and
+# which we are interested in are:
+@MDSD
+@MDG1
+@MDG2
+@region.stats@minor.allele.freqs
+@region.stats@site.FST
+
+# Before exiting the R session we will save the objects that we have
+# built up thus far. It will be easier to GENOME datasets that we
+# have already calculated statistics for rather than calculating
+# them all over again. Many of the statistics take too long to
+# calculate to make calculating them again feasable.
+save.session(datGP, '~/starling_gbs/vcf/landgen/data/popgenome/datGP')
+
+# ----------------------------------------------------------------- #
+#                         LOAD GENOME OBJECTS                       #
+# ----------------------------------------------------------------- #
+library(PopGenome)
+# We will load all of the saved GENOME objects that we created
+# previously.
+load.session('~/starling_gbs/vcf/landgen/data/popgenome/dat')
+load.session('~/starling_gbs/vcf/landgen/data/popgenome/datGP')
+
+# We will now get the population F_ST values for each of our datasets
+fst.table <- data.frame('Level' = c('Colection Localities', 'Genetic Populations'),
+						'Fst' = c(datCL@nucleotide.F_ST, datGP@nucleotide.F_ST),
+                    'HudsonSnn' = c(datCL@Hudson.Snn, datGP@Hudson.Snn))
+colnames(fst.table) <- c('Level', 'Fst', 'HudsonSnn')
+
+# Now we will export this table.
+write.table(fst.table, '~/starling_gbs/vcf/landgen/output/popgenome/gobal_fst_table.txt',
+            sep = '\t', col.names = TRUE, row.names = FALSE)
+
+
+# Now we will get some statistics for each colleciton locality.
+popsCL <- data.frame('popCL' = c('Albury', 'AustralEden', 'Bendigo',
+                             'Condingup', 'Coorabie', 'Cygnet',
+                             'Dubbo', 'Hay', 'KingIsland',
+                             'LemonTree', 'Lismore', 'Maitland',
+                             'McLarenvale', 'Moree', 'Munglinup',
+                             'Nowra', 'Nyngan', 'Orbost', 'Sheffiled',
+                             'StreakyBay', 'Tamworth', 'TumbyBay',
+                             'Warnambool', 'Wonthaggi'))
+
+popCLData <- data.frame('pop' = popsCL,
+                      data.frame('N' = unlist(lapply(datCL@region.data@populations2[[1]], function(x) length(x)))),
+                      'Fst.V.all' = t(datCL@nuc.F_ST.vs.all),
+                      'seg.sites' = t(datCL@n.segregating.sites),
+                      'diver.within' = t(datCL@nuc.diversity.within),
+                      'Tajima' = t(datCL@Tajima.D),
+                      'Fu.Li.F' = t(datCL@Fu.Li.F),
+                      'Fu.Li.D' = t(datCL@Fu.Li.D),
+                      'Fu.F_S' = t(datCL@Fu.F_S),
+                      'RozasR2' = t(datCL@Rozas.R_2),
+                      'MDSD' = t(datCL@MDSD),
+                      'MDG1' = t(datCL@MDG1),
+                      'MDG2' = t(datCL@MDG2))
+
+# Now we will export these tables.
+
+write.table(popCLData, '~/starling_gbs/vcf/landgen/output/popgenome/popCL_PopGenome_stats.txt',
+            sep = '\t', col.names = TRUE, row.names = TRUE)
+
+# We also want to export the pairwise Fst and diversity statistics,
+# so we can test for IBD.
+write.table(datCL@nuc.F_ST.pairwise, '~/starling_gbs/vcf/landgen/output/popgenome/datCL_pairwise_fst.txt',
+            sep = '\t', col.names = TRUE, row.names = TRUE)
+
+
+# Now we will get some statistics for each genetic population.
+popGP <- data.frame('popGP' = c('p1.1', 'p1.2', 'p2', 'p3'))
+
+popGPData <- data.frame('pop' = popGP,
+                      data.frame('N' = unlist(lapply(datGP@region.data@populations2[[1]], function(x) length(x)))),
+                      'Fst.V.all' = t(datGP@nuc.F_ST.vs.all),
+                      'seg.sites' = t(datGP@n.segregating.sites),
+                      'diver.within' = t(datGP@nuc.diversity.within),
+                      'Tajima' = t(datGP@Tajima.D),
+                      'Fu.Li.F' = t(datGP@Fu.Li.F),
+                      'Fu.Li.D' = t(datGP@Fu.Li.D),
+                      'Fu.F_S' = t(datGP@Fu.F_S),
+                      'RozasR2' = t(datGP@Rozas.R_2),
+                      'MDSD' = t(datGP@MDSD),
+                      'MDG1' = t(datGP@MDG1),
+                      'MDG2' = t(datGP@MDG2))
+
+# Now we will export these tables.
+
+write.table(popGPData, '~/starling_gbs/vcf/landgen/output/popgenome/popGP_PopGenome_stats.txt',
+            sep = '\t', col.names = TRUE, row.names = TRUE)
+
+# We also want to export the pairwise Fst and diversity statistics,
+# so we can test for IBD.
+write.table(datGP@nuc.F_ST.pairwise, '~/starling_gbs/vcf/landgen/output/popgenome/datGP_pairwise_fst.txt',
+            sep = '\t', col.names = TRUE, row.names = TRUE)
+
+# ----------------------------------------------------------------- #
+#                      4. pegas analysis  	                        #
+# ----------------------------------------------------------------- #
+# Pegas is a package in R that calculates general population
+# statistics on large SNP datasets. All of the following calculations
+# are done in R.
+R
+
+# First we need to load the PopGenome package.
+library(pegas)
+
+# To import the data we use the 'read.vcf()' function.
+datPeg <- read.vcf("/home/apcar/starling_gbs/vcf/landgen/data/data_formats/landgen_data.recode.vcf.gz", nloci = 16300, skip = 0)
+
+datPeg <- read.loci("/home/apcar/starling_gbs/vcf/landgen/data/landgen_data_gstudio.txt",
+					loci.sep = "\t", col.loci = 72:16371, col.pop = 2, header = TRUE)
+
+# Now we want to specify the populations for our data, so first we
+# will create population vectors which identify which samples are
+# in each population. We will do this with a file called populations
+# to save us copy pasting everything.
+source('/home/apcar/starling_gbs/vcf/landgen/src/populations.R')
+
+# We will bring in the file that has our sample names in it and
+# the file with corresponding collection locality names so we
+# can match them up and assign hierarchical levels to the data.
+samps <- read.table('~/starling_gbs/vcf/landgen/output/fs/global/landgen_data_dp.txt', sep = '\t', header = TRUE)
+
+# This samps file will have each row in the same order as the data
+# from the datPeg files. Later on we want to merge these two data
+# sets but the .meanQ data wont have any identifying info to do so,
+# except for the order in which the file is imported. So before we
+# start playing with our 'samps' data and changing the order of
+# things we will create a new column which we will use to order by
+# later to make sure our samples will align when we merge them.
+samps$ord <- 1:nrow(samps)
+
+# Now the collection locality file with lat/lon information
+pops <- read.table('~/starling_gbs/morph/key-file_morph_env_allplates.txt', sep = '\t', header = TRUE)
+
+# Now we will merge these two data sets so we have a matching
+# collection locality  for every sample in our data.
+samps <- merge(samps, pops, by.x = "INDV", by.y = "FullSampleName", all.x = TRUE, all.y = FALSE)
+samps <- merge(samps, GPSamples, by.x = "INDV", by.y = "samp", all.x = TRUE, all.y = FALSE)
+
+# To get a nice looking plots our samples need to
+# be ordered prior to graphing. This is because ggplot2 graphs things
+# in the order they appear in the data.frame. We will bring in the
+# file which orders our populations across Australian from west to
+# east. We will also give the columns appropriate names.
+gord <- read.table('~/starling_gbs/pops/pop_ordered_across_aust.txt', sep = '\t', header = FALSE)
+colnames(gord) <- c('location', 'order')
+
+# Before we merge or samps data and order data we will first need
+# to make sure the location names match exactly.
+summary(samps$location)
+gord
+
+# Now we will merge this with our samps data set so we can
+# order our data.frame by locality and then longitude.
+samps <- merge(samps, gord, by.x = 'location', by.y = 'location', all.x = TRUE, all.y = FALSE)
+
+# This merge has reordered our data.frame, we need to get it back into
+# the correct order before merging it with our .meanQ data in a
+# moment.
+samps <- samps[order(samps[,'ord']),]
+samps[407, 'pop'] <- 'p2'
+
+# Now that we know which collection locality and genetic population
+# each sample corresponds to we can set the population variable in
+# the datPeg data.
+datPegCL <- datPeg
+datPegGP <- datPeg
+
+datPegCL$population <- samps$location
+datPegGP$population <- samps$pop
+
+# Now we will calculate the geodesic (greater circle) distance
+# between pairs of points so that we can run an AMOVA. To do this
+# we first need to find the middle lat/lon for each collection
+# locality in our data set.
+meanLon <- do.call(data.frame, aggregate(x ~  location, data = samps,
+          function(x) c(m = mean(x))))
+
+meanLat <- do.call(data.frame, aggregate(y ~  location, data = samps,
+          function(x) c(mean(x))))
+CLdist <- cbind(meanLon[,2], meanLat[,2])
+
+# To determine the greater circle distance we need to use the
+# geosphere package.
+library(sp)
+
+# Now we can use the greatCircle distance between out points.
+CLdistMatrix <- data.frame(spDists(CLdist, longlat = TRUE))
+colnames(CLdistMatrix) <- row.names(data.frame(summary(samps$location)))
+rownames(CLdistMatrix) <- row.names(data.frame(summary(samps$location)))
+
+# We will write this distance matrix out.
+write.table(CLdistMatrix, '~/starling_gbs/vcf/landgen/output/popgenome/CL_pairwise_greatCircle_dist.txt',
+            sep = '\t', col.names = TRUE, row.names = TRUE)
+
+# Now we can run our AMOVA analysis. First we need to calculate
+# a genetic distance matrix.
+genDistMatrix <- dist.dna(datPegCL)
+CL <- samps$pop
+GP <- samps$location
+datAMOVA <- amova(genDistMatrix ~ CL/GP, nperm = 10)
+
+# GOT TO THE POINT OF TRYING TO RUN AMOVA BUT IT ISNT
+# WORKING. WILL TRY AND SEE ID I CAN RUN IT IN GSTUDIO
+# BUT NEEDS TO IMPORT DATA AS GENEPOP. HAVE TRIED DOING THIS.
+
+# To get data into adegenet
+read.PLINK('~/starling_gbs/vcf/landgen/data/data_formats/landgen_data.raw',
+			map.file = '~/starling_gbs/vcf/landgen/data/data_formats/landgen_data.map',
+			parallel = TRUE, n.cores = 4)
+
+
+# ----------------------------------------------------------------- #
+#                      4. Gstudio analysis  	                    #
+# ----------------------------------------------------------------- #
+# Gstudio looks like a promising R package for data analysis. To get
+# data into gstudio we need to format the data, I have done this by
+# using PGDSPider to converting it to a structure format.
+# Each sample is represented by 2 rows and each column is
+# a loci. A = 1, T = 2, G = 3, C = 4. We want to convert it
+# so each column is a loci with each samples genotype at
+# the loci being represented by X:X. We need to play with
+# the structure file format to get it to look like this.
+
+# First we read in the stucture data, and create a file format that
+# will work in gstudio.
+d <- read.table('~/starling_gbs/vcf/landgen/data/landgen_data_structure.txt', sep = '\t', header = TRUE)
+
+d1 <- as.data.frame(lapply(d[2:length(d)], FUN = function(x) gsub(1, "A", x)))
+d1 <- as.data.frame(lapply(d1[1:length(d1)], FUN = function(x) gsub(2, "T", x)))
+d1 <- as.data.frame(lapply(d1[1:length(d1)], FUN = function(x) gsub(3, "G", x)))
+d1 <- as.data.frame(lapply(d1[1:length(d1)], FUN = function(x) gsub(4, "C", x)))
+d1 <- as.data.frame(lapply(d1[1:length(d1)], FUN = function(x) gsub(-9, "NA", x)))
+d1 <- data.frame(d['id'], d1)
+d1[1:10,1:10]
+d1 <- aggregate(cbind(d1[,2:length(d1)]), d1['id'], paste, collapse = ':')
+d2 <- as.data.frame(lapply(d1[2:length(d1)], FUN = function(x) gsub("NA:NA", "", x)))
+d2 <- data.frame(d1$id, d2)
+
+# We will now import some additional data that we can add to this data
+# set
+samps <- read.table('Dropbox/Manuscripts/landGen/data/sample_info.txt',
+					sep = '\t', header = TRUE)
+
+# Many of the gstudio functions require a Longitude and Latitude
+# column and work best when all individuals from the same
+# strata (collection locatlity) have the same Lon/Lat. We will
+# add mean Lon/Lat to out data frame.
+dflon <- do.call(data.frame, aggregate(x ~ location,
+                                       data = samps,
+                                       function(x) c(mean(x)),
+                                       na.action = na.omit))
+
+dflat <- do.call(data.frame, aggregate(y ~ location,
+                                       data = samps,
+                                       function(x) c(mean(x)),
+                                       na.action = na.omit))
+
+loc.dat <- data.frame(dflon[,1:2], dflat[,2])
+
+# Change column names and merge
+colnames(loc.dat) <- c("location", "Longitude", "Latitude")
+samps <- merge(samps, loc.dat, by = 'location')
+write.table(samps, 'Dropbox/Manuscripts/landGen/data/sample_info.txt',
+            sep = '\t', col.names = TRUE, row.names = FALSE)
+
+
+# Now we can merge our two data frames
+d2 <- merge(samps, d2, by.x = 'INDV', by.y = 'd1.id')
+
+write.table(d2, 'Dropbox/Manuscripts/landGen/data/landgen_data_gstudio.txt',
+            sep = '\t', col.names = TRUE, row.names = FALSE)
+
+# Now we want to open the file with gstudio.
+library(gstudio)
+dat <- read_population('Dropbox/Manuscripts/landGen/data/landgen_data_gstudio.txt',
+						type = 'separated', locus.columns = 72:16371, sep = '\t',
+						header = TRUE)
+colnames(dat)[6] <- 'Longitude'
+colnames(dat)[7] <- 'Latitude'
+
+# We will now partition the data by some stratum that we are interested in,
+# using the partition() function in 'gstudio'.
+cLoc <- partition(dat, stratum = 'location')
+gPop <- partition(dat, stratum = 'pop')
+pSex <- partition(dat, stratum = 'sex')
+
+# Lets plot our data. First we want to work out the cetral point
+# so that we can use it to request a map from ggmap.
+require(ggmap)
+map <- ggmap()
+
+uniq <- unique(dat[,c('pop', 'location', 'Longitude','Latitude')])
+centroid <- apply(uniq[, 3:4], 2, mean)
+map <- population_map(uniq)
+ggmap(map) + geom_point(aes(x = Longitude, y = Latitude, color = pop),
+							data = uniq, size = 4)
+
+
+# We will calculate the frequency of each of the loci.
+freqs.loci <- frequencies(dat)
+
+# GENETIC DISTANCE
+# To calculate genetic structure
+dist.euc <- genetic_distance(dat, mode = "Euclidean", stratum = 'location')
+dist.cgd <- genetic_distance(dat, mode = "cGD", stratum = 'location')
+dist.nei <- genetic_distance(dat, mode = "Nei", stratum = 'location')
+dist.dps <- genetic_distance(dat, mode = "Dps", stratum = 'location')
+dist.jac <- genetic_distance(dat, mode = "Jaccard", stratum = 'location')
+
+# GENETIC STRUCTURE
+gStructCL <- genetic_structure(dat, stratum = 'location', mode = c('Gst', 'Dest'),
+								nperm = 5, size.correct = TRUE, pairwise = FALSE)
+
+
+
+
+# For an AMOVA analysis we need both pegas and gstudio.
+# We will use gstudio to create a distance matrix and then
+# run this through amova in pegas. First we need to import
+# our data.
+dat <- read_population('/home/apcar/starling_gbs/vcf/landgen/data/landgen_data_gstudio.txt',
+						type = 'separated', locus.columns = 72:16371, sep = '\t',
+						header = TRUE)
+
+# Now we will calculate our distance matrix.
+dist.nei <- genetic_distance(dat, mode = "Nei", stratum = 'location')
+write.table(dist.nei, '/home/apcar/starling_gbs/vcf/landgen/output/dist_nei.txt',
+			sep = '\t', col.names = TRUE, row.names = TRUE)
+
+neiLow <- as.dist(dist.nei, diag = FALSE, upper = FALSE)
+grp <- as.data.frame(row.names(dist.nei))
+colnames(grp) <- 'location'
+grp$pop <- c('3', '4', '3', '2', '2', '2', '4', '3', '3', '4',
+				'4', '4', '2', '4', '1', '4', '4', '3', '2',
+				'2', '4', '2', '3', '3')
+grp1 <- grp[2:24,]
+gp <- factor(grp1$pop)
+cl <- factor(grp1$location)
+neiAMOVA <- amova(neiLow ~ gp/cl, nperm = 1000)
+neiAMOVAgp <- amova(neiLow ~ gp, nperm = 1000)
+neiAMOVAcl <- amova(neiLow ~ cl, nperm = 1000)
