@@ -1,0 +1,39 @@
+SCRIPT AUTHORS
+
+
+KATARINA C. STUART:
+
+Aus_starling_GBS_RDA.R
+Sample_distribution_map.R
+
+ADAM P. A. CARDILINI:
+
+1.0-gbs_anal.sh
+2.0-filtering_snps2.sh
+2.1-minDP.sh
+2.2-snps_max-missing.sh
+2.3-indv-missing.sh
+2.4-site_depth.sh
+2.5-rm_indv.sh
+2.6-max-missing_lvls.sh
+3.0-landGenetics_analysis.txt
+3.1-depth-info.sh
+3.1-hwe_calc_vcftools_40.sh
+3.10-s_fs.sh
+3.11-r_fs.sh
+3.11.1-r_fs.sh
+3.12-sub_s_fs.sh
+3.2-hwe_calc_vcftools.sh
+3.4-rmSNP_hwe.sh
+3.5-depth-info2.sh
+3.6-transform-data.sh
+3.7-s_fs.sh
+3.7.1-r_fs.sh
+3.8-choosek-datainfo.sh
+3.9-transform-split-data
+4.1-diveRsity.R
+calc_bf.sh
+hierfstat_fstCI.R
+popgenomeBayeScanR.R
+populations.R
+sex-hierfstat.R
